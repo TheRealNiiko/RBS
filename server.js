@@ -7,6 +7,13 @@ const app = express();
 const PORT = 8080;
 const DOH_SERVER = 'https://cloudflare-dns.com/dns-query';
 
+
+/*
+ * ============================================
+ * FIXED SITES
+ * ============================================
+ */
+
 const SITES = {
     wikipedia: {
         protocol: 'https:',
@@ -29,9 +36,17 @@ const SITES = {
     }
 };
 
+
+/*
+ * ============================================
+ * HOSTNAME -> SITE NAME
+ * ============================================
+ */
+
 const HOST_TO_SITE = {};
 
 for (const [name, site] of Object.entries(SITES)) {
+
     HOST_TO_SITE[name] = name;
 
     const hostname = site.hostname.toLowerCase();
@@ -43,16 +58,51 @@ for (const [name, site] of Object.entries(SITES)) {
     }
 }
 
+
+/*
+ * ============================================
+ * PINTEREST ROOT-LEVEL INTERNAL PATHS
+ * ============================================
+ *
+ * Pinterest can make requests such as:
+ *
+ *     /_/_/storage_report/
+ *     /_/graphql/
+ *     /resource/...
+ *     /secure/...
+ *
+ * These paths don't contain /pin/.
+ *
+ * We route them to Pinterest server-side.
+ */
+
+const PINTEREST_ROOT_PREFIXES = [
+    '/resource/',
+    '/secure/',
+    '/_/',
+    '/_/_/'
+];
+
+
+/*
+ * ============================================
+ * PROXY
+ * ============================================
+ */
+
 const proxy = httpProxy.createProxyServer({
     changeOrigin: true
 });
 
 
-/* =========================================================
-   HOSTNAME VALIDATION
-   ========================================================= */
+/*
+ * ============================================
+ * HOSTNAME VALIDATION
+ * ============================================
+ */
 
 function isValidHostname(hostname) {
+
     if (!hostname) {
         return false;
     }
@@ -87,25 +137,97 @@ function isValidHostname(hostname) {
 }
 
 
-/* =========================================================
-   SITE LOOKUP
-   ========================================================= */
+/*
+ * ============================================
+ * GET SITE NAME
+ * ============================================
+ */
 
 function getSiteName(hostname) {
+
     hostname = hostname.toLowerCase();
 
     return HOST_TO_SITE[hostname] || null;
 }
 
 
-/* =========================================================
-   DOH
-   ========================================================= */
+/*
+ * ============================================
+ * CHECK PINTEREST ROOT PATH
+ * ============================================
+ */
+
+function isPinterestRootPath(pathname) {
+
+    return PINTEREST_ROOT_PREFIXES.some(
+        prefix => pathname.startsWith(prefix)
+    );
+}
+
+
+/*
+ * ============================================
+ * CHECK WHETHER REQUEST CAME FROM /pin/
+ * ============================================
+ *
+ * This is the important replacement for the
+ * browser-side API shim.
+ *
+ * We leave Pinterest HTML untouched.
+ *
+ * If Pinterest JavaScript requests:
+ *
+ *     /_/graphql/
+ *
+ * the browser sends the Referer:
+ *
+ *     https://our-proxy.app.github.dev/pin/
+ *
+ * We can therefore determine that the request
+ * belongs to Pinterest without modifying the
+ * HTML or JavaScript.
+ */
+
+function requestCameFromPinterest(req) {
+
+    const referer =
+        req.headers.referer ||
+        req.headers.referrer ||
+        '';
+
+    if (!referer) {
+        return false;
+    }
+
+    try {
+
+        const parsed =
+            new URL(referer);
+
+        return (
+            parsed.pathname === '/pin' ||
+            parsed.pathname.startsWith('/pin/')
+        );
+
+    } catch {
+
+        return false;
+    }
+}
+
+
+/*
+ * ============================================
+ * DNS OVER HTTPS
+ * ============================================
+ */
 
 async function resolveDoH(hostname) {
+
     hostname = hostname.toLowerCase();
 
     if (!isValidHostname(hostname)) {
+
         throw new Error(
             `Invalid hostname: ${hostname}`
         );
@@ -119,12 +241,13 @@ async function resolveDoH(hostname) {
             url,
             {
                 headers: {
-                    'Accept': 'application/dns-json'
+                    Accept: 'application/dns-json'
                 }
             }
         );
 
     if (!response.ok) {
+
         throw new Error(
             `DoH request failed: ${response.status} ${response.statusText}`
         );
@@ -139,6 +262,7 @@ async function resolveDoH(hostname) {
         );
 
     if (!answer) {
+
         throw new Error(
             `No A record found for ${hostname}`
         );
@@ -148,14 +272,17 @@ async function resolveDoH(hostname) {
 }
 
 
-/* =========================================================
-   LOCAL URL CONVERSION
-   ========================================================= */
+/*
+ * ============================================
+ * EXTERNAL URL -> LOCAL URL
+ * ============================================
+ */
 
 function makeLocalUrl(url) {
+
     try {
-        const parsed =
-            new URL(url);
+
+        const parsed = new URL(url);
 
         const hostname =
             parsed.hostname.toLowerCase();
@@ -163,7 +290,13 @@ function makeLocalUrl(url) {
         const siteName =
             getSiteName(hostname);
 
+
+        /*
+         * Fixed site.
+         */
+
         if (siteName) {
+
             return (
                 `/${siteName}` +
                 `${parsed.pathname || '/'}` +
@@ -171,6 +304,11 @@ function makeLocalUrl(url) {
                 `${parsed.hash || ''}`
             );
         }
+
+
+        /*
+         * External hostname.
+         */
 
         if (!isValidHostname(hostname)) {
             return url;
@@ -182,17 +320,26 @@ function makeLocalUrl(url) {
             `${parsed.search || ''}` +
             `${parsed.hash || ''}`
         );
+
     } catch {
+
         return url;
     }
 }
 
 
-/* =========================================================
-   URL REWRITING
-   ========================================================= */
+/*
+ * ============================================
+ * REWRITE HTML ATTRIBUTE URL
+ * ============================================
+ *
+ * Used for sites other than Pinterest.
+ *
+ * Pinterest HTML is NOT passed through this.
+ */
 
 function rewriteUrl(url, currentSite) {
+
     if (!url) {
         return url;
     }
@@ -214,17 +361,22 @@ function rewriteUrl(url, currentSite) {
     }
 
     if (url.startsWith('//')) {
-        return makeLocalUrl(`https:${url}`);
+
+        return makeLocalUrl(
+            `https:${url}`
+        );
     }
 
     if (
         url.startsWith('http://') ||
         url.startsWith('https://')
     ) {
+
         return makeLocalUrl(url);
     }
 
     if (url.startsWith('/')) {
+
         return `/${currentSite}${url}`;
     }
 
@@ -232,11 +384,73 @@ function rewriteUrl(url, currentSite) {
 }
 
 
-function rewriteHtml(html, currentSite) {
+/*
+ * ============================================
+ * REMOVE CSP META TAGS
+ * ============================================
+ *
+ * Only used for non-Pinterest HTML.
+ *
+ * Pinterest HTML remains completely untouched.
+ */
+
+function removeCspMetaTags(html) {
+
+    return html.replace(
+        /<meta\b[^>]*http-equiv\s*=\s*["']Content-Security-Policy(?:-Report-Only)?["'][^>]*>/gi,
+        ''
+    );
+}
+
+
+/*
+ * ============================================
+ * REWRITE HTML ATTRIBUTES
+ * ============================================
+ *
+ * Used for non-Pinterest fixed sites.
+ */
+
+function rewriteHtmlAttributes(html, currentSite) {
+
+    const protectedBlocks = [];
+
+
+    /*
+     * Protect script/style contents.
+     */
+
+    html = html.replace(
+        /<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi,
+
+        block => {
+
+            const index =
+                protectedBlocks.length;
+
+            protectedBlocks.push(block);
+
+            return (
+                `___PROXY_PROTECTED_BLOCK_${index}___`
+            );
+        }
+    );
+
+
+    /*
+     * href/src/action/etc.
+     */
 
     html = html.replace(
         /(\b(?:href|src|action|poster|data-src|data-href)\s*=\s*)(["'])(.*?)\2/gi,
-        (match, prefix, quote, url) => {
+
+        (
+            match,
+            prefix,
+            quote,
+            url
+        ) => {
+
             return (
                 prefix +
                 quote +
@@ -250,25 +464,19 @@ function rewriteHtml(html, currentSite) {
     );
 
 
-    html = html.replace(
-        /(\bcontent\s*=\s*)(["'])(.*?)\2/gi,
-        (match, prefix, quote, value) => {
-            return (
-                prefix +
-                quote +
-                rewriteUrl(
-                    value,
-                    currentSite
-                ) +
-                quote
-            );
-        }
-    );
-
+    /*
+     * srcset.
+     */
 
     html = html.replace(
         /(\bsrcset\s*=\s*)(["'])(.*?)\2/gi,
-        (match, prefix, quote, value) => {
+
+        (
+            match,
+            prefix,
+            quote,
+            value
+        ) => {
 
             const rewritten =
                 value
@@ -304,55 +512,21 @@ function rewriteHtml(html, currentSite) {
     );
 
 
-    html = html.replace(
-        /url\(\s*(["']?)(.*?)\1\s*\)/gi,
-        (match, quote, url) => {
-
-            if (!url) {
-                return match;
-            }
-
-            const rewritten =
-                rewriteUrl(
-                    url,
-                    currentSite
-                );
-
-            return (
-                `url(${quote}${rewritten}${quote})`
-            );
-        }
-    );
-
+    /*
+     * Restore protected blocks.
+     */
 
     html = html.replace(
-        /https?:\/\/[A-Za-z0-9.-]+(?::\d+)?(?:\/[^\s"'<>\\)]*)?/gi,
-        url => {
-            return makeLocalUrl(url);
-        }
-    );
+        /___PROXY_PROTECTED_BLOCK_(\d+)___/g,
 
-
-    html = html.replace(
-        /(^|["'\s(])\/\/([A-Za-z0-9.-]+)(\/[^"'()\s<>]*)?/g,
         (
             match,
-            prefix,
-            hostname,
-            path = '/'
+            index
         ) => {
 
-            if (!isValidHostname(hostname)) {
-                return match;
-            }
-
-            const fullUrl =
-                `https://${hostname}${path}`;
-
-            return (
-                prefix +
-                makeLocalUrl(fullUrl)
-            );
+            return protectedBlocks[
+                Number(index)
+            ];
         }
     );
 
@@ -360,11 +534,13 @@ function rewriteHtml(html, currentSite) {
 }
 
 
-/* =========================================================
-   EXPLICIT PROXY URL
-   ========================================================= */
+/*
+ * ============================================
+ * PARSE PROXY URL
+ * ============================================
+ */
 
-function parseExplicitSiteUrl(url) {
+function parseProxyUrl(url) {
 
     const parsed =
         new URL(
@@ -385,11 +561,7 @@ function parseExplicitSiteUrl(url) {
 
 
     /*
-     * Fixed sites:
-     *
-     * /pin/...
-     * /github/...
-     * /wikipedia/...
+     * Fixed site.
      */
 
     if (SITES[first]) {
@@ -405,8 +577,7 @@ function parseExplicitSiteUrl(url) {
 
         return {
 
-            siteName:
-                first,
+            siteName: first,
 
             protocol:
                 site.protocol,
@@ -426,13 +597,10 @@ function parseExplicitSiteUrl(url) {
 
 
     /*
-     * Explicit external hostname:
-     *
-     * /s2.pinimg.com/...
+     * External hostname.
      */
 
-    const hostname =
-        first;
+    const hostname = first;
 
     if (!isValidHostname(hostname)) {
         return null;
@@ -446,14 +614,11 @@ function parseExplicitSiteUrl(url) {
 
     return {
 
-        siteName:
-            getSiteName(hostname),
+        siteName: null,
 
-        protocol:
-            'https:',
+        protocol: 'https:',
 
-        hostname:
-            hostname,
+        hostname,
 
         path:
             remainingPath === '/'
@@ -466,337 +631,132 @@ function parseExplicitSiteUrl(url) {
 }
 
 
-/* =========================================================
-   SERVICE WORKER
-   ========================================================= */
+/*
+ * ============================================
+ * PROXY A REQUEST DIRECTLY
+ * ============================================
+ */
 
-const SERVICE_WORKER = `
-
-const FIXED_SITES = {
-    wikipedia: "wikipedia",
-    github: "github",
-    example: "example",
-    pin: "pin"
-};
-
-self.addEventListener(
-    "install",
-    event => {
-        self.skipWaiting();
+function sendToProxy(
+    req,
+    res,
+    {
+        hostname,
+        protocol,
+        path,
+        search,
+        siteName = null
     }
-);
-
-self.addEventListener(
-    "activate",
-    event => {
-        event.waitUntil(
-            self.clients.claim()
-        );
-    }
-);
-
-self.addEventListener(
-    "fetch",
-    event => {
-
-        const request =
-            event.request;
-
-        const url =
-            new URL(request.url);
-
-
-        /*
-         * Only handle requests belonging
-         * to this proxy origin.
-         */
-
-        if (
-            url.origin !== self.location.origin
-        ) {
-            return;
-        }
-
-
-        /*
-         * Never intercept the service
-         * worker itself.
-         */
-
-        if (
-            url.pathname === "/__proxy_sw.js"
-        ) {
-            return;
-        }
-
-
-        /*
-         * Requests that already have an
-         * explicit site are allowed through.
-         *
-         * Example:
-         *
-         * /pin/foo
-         * /github/foo
-         */
-
-        const first =
-            url.pathname
-                .split("/")
-                .filter(Boolean)[0]
-                ?.toLowerCase();
-
-
-        if (
-            first &&
-            (
-                FIXED_SITES[first] ||
-                first.includes(".")
-            )
-        ) {
-            return;
-        }
-
-
-        /*
-         * Find the browser tab/client
-         * that generated this request.
-         */
-
-        event.respondWith(
-            (async () => {
-
-                const client =
-                    await self.clients.get(
-                        event.clientId
-                    );
-
-
-                if (!client) {
-                    return fetch(request);
-                }
-
-
-                const clientUrl =
-                    new URL(
-                        client.url
-                    );
-
-
-                const clientParts =
-                    clientUrl.pathname
-                        .split("/")
-                        .filter(Boolean);
-
-
-                const siteName =
-                    clientParts[0]
-                        ?.toLowerCase();
-
-
-                /*
-                 * The current browser page
-                 * must belong to one of our
-                 * fixed sites.
-                 */
-
-                if (
-                    !siteName ||
-                    !FIXED_SITES[siteName]
-                ) {
-                    return fetch(request);
-                }
-
-
-                /*
-                 * Turn:
-                 *
-                 * /_/_/trace/trace/
-                 *
-                 * into:
-                 *
-                 * /pin/_/_/trace/trace/
-                 *
-                 * for a Pinterest tab.
-                 */
-
-                const rewritten =
-                    new URL(
-                        "/" +
-                        siteName +
-                        url.pathname +
-                        url.search,
-                        url.origin
-                    );
-
-
-                /*
-                 * Tell the service worker that
-                 * this request has already been
-                 * routed, so it doesn't recurse.
-                 */
-
-                const headers =
-                    new Headers(
-                        request.headers
-                    );
-
-                headers.set(
-                    "X-Proxy-Routed",
-                    "1"
-                );
-
-
-                const routedRequest =
-                    new Request(
-                        rewritten,
-                        {
-                            method:
-                                request.method,
-
-                            headers:
-                                headers,
-
-                            body:
-                                (
-                                    request.method !== "GET" &&
-                                    request.method !== "HEAD"
-                                )
-                                    ? request.body
-                                    : undefined,
-
-                            mode:
-                                request.mode,
-
-                            credentials:
-                                request.credentials,
-
-                            cache:
-                                request.cache,
-
-                            redirect:
-                                request.redirect,
-
-                            referrer:
-                                request.referrer,
-
-                            referrerPolicy:
-                                request.referrerPolicy,
-
-                            integrity:
-                                request.integrity,
-
-                            keepalive:
-                                request.keepalive
-                        }
-                    );
-
-
-                return fetch(
-                    routedRequest
-                );
-
-            })()
-        );
-    }
-);
-`;
-
-
-/* =========================================================
-   SERVICE WORKER ENDPOINT
-   ========================================================= */
-
-app.get(
-    '/__proxy_sw.js',
-    (req, res) => {
-
-        res.setHeader(
-            'Content-Type',
-            'application/javascript'
-        );
-
-        res.setHeader(
-            'Cache-Control',
-            'no-store'
-        );
-
-        res.setHeader(
-            'Service-Worker-Allowed',
-            '/'
-        );
-
-        res.send(
-            SERVICE_WORKER
-        );
-    }
-);
-
-
-/* =========================================================
-   SERVICE WORKER REGISTRATION
-   ========================================================= */
-
-function injectServiceWorker(html) {
-
-    const registrationScript = `
-<script>
-if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register(
-        '/__proxy_sw.js',
-        {
-            scope: '/'
-        }
-    ).catch(error => {
-        console.error(
-            '[Proxy] Service worker registration failed:',
-            error
-        );
-    });
-}
-</script>
-`;
-
-
-if (
-    /<\/head>/i.test(html)
 ) {
 
-    return html.replace(
-        /<\/head>/i,
-        registrationScript +
-        '</head>'
-    );
+    resolveDoH(hostname)
+
+        .then(ip => {
+
+            console.log(
+                `[DNS] ${hostname} -> ${ip}`
+            );
+
+            console.log(
+                `[PROXY] ${req.method} ${hostname}${path}${search}`
+            );
+
+
+            /*
+             * This is the URL that the upstream
+             * server actually receives.
+             */
+
+            req.url =
+                path +
+                search;
+
+
+            /*
+             * Tell proxyRes which site this
+             * request belongs to.
+             */
+
+            req.proxySiteName =
+                siteName;
+
+
+            const agent =
+                new https.Agent({
+                    servername: hostname
+                });
+
+
+            proxy.web(
+                req,
+                res,
+                {
+
+                    target:
+                        `${protocol}//${ip}`,
+
+                    changeOrigin: true,
+
+                    selfHandleResponse: true,
+
+                    agent,
+
+                    headers: {
+
+                        Host: hostname,
+
+                        /*
+                         * Don't let upstream send
+                         * compressed HTML.
+                         */
+
+                        'Accept-Encoding':
+                            'identity'
+                    }
+                }
+            );
+
+        })
+
+        .catch(error => {
+
+            console.error(
+                `[ERROR] ${hostname}:`,
+                error.message
+            );
+
+            if (!res.headersSent) {
+
+                res
+                    .status(502)
+                    .send(
+                        `DNS/proxy error: ${error.message}`
+                    );
+            }
+        });
 }
 
 
-    return (
-        registrationScript +
-        html
-    );
-}
-
-
-/* =========================================================
-   MAIN PROXY
-   ========================================================= */
+/*
+ * ============================================
+ * MAIN REQUEST HANDLER
+ * ============================================
+ */
 
 function proxyRequest(req, res) {
 
+    const pathname = req.path;
+
+
     /*
-     * If the request was generated by the
-     * service worker, it has already been
-     * transformed into:
-     *
-     * /pin/...
-     *
-     * so normal parsing handles it.
+     * ========================================
+     * ROOT PAGE
+     * ========================================
      */
 
-
     if (
-        req.path === '/' ||
-        req.path === ''
+        pathname === '/' ||
+        pathname === ''
     ) {
 
         const links =
@@ -821,13 +781,8 @@ function proxyRequest(req, res) {
             <html>
 
             <head>
-
                 <meta charset="UTF-8">
-
-                <title>
-                    Fixed DoH Proxy
-                </title>
-
+                <title>Fixed DoH Proxy</title>
             </head>
 
             <body>
@@ -849,20 +804,141 @@ function proxyRequest(req, res) {
     }
 
 
+    /*
+     * ========================================
+     * PINTEREST ROOT-LEVEL REQUEST
+     * ========================================
+     *
+     * Example:
+     *
+     *     /_/_/storage_report/
+     *
+     * is sent directly to:
+     *
+     *     www.pinterest.com/_/_/storage_report/
+     *
+     * without changing the browser's URL.
+     */
+
+    if (
+        isPinterestRootPath(pathname)
+    ) {
+
+        console.log(
+            `[PINTEREST ROOT] ${req.method} ${req.originalUrl}`
+        );
+
+
+        sendToProxy(
+            req,
+            res,
+            {
+
+                hostname:
+                    SITES.pin.hostname,
+
+                protocol:
+                    SITES.pin.protocol,
+
+                path:
+                    pathname,
+
+                search:
+                    req.url.includes('?')
+                        ? req.url.substring(
+                            req.url.indexOf('?')
+                        )
+                        : '',
+
+                siteName:
+                    'pin'
+            }
+        );
+
+        return;
+    }
+
+
+    /*
+     * ========================================
+     * PINTEREST ROOT-RELATIVE REQUEST
+     * VIA REFERER
+     * ========================================
+     *
+     * This is the important part.
+     *
+     * Pinterest HTML stays untouched.
+     *
+     * If JavaScript loaded from /pin/ asks for:
+     *
+     *     /some/api/path
+     *
+     * the Referer tells us the request came
+     * from the Pinterest proxy page.
+     */
+
+    if (
+        pathname !== '/' &&
+        requestCameFromPinterest(req)
+    ) {
+
+        console.log(
+            `[PINTEREST REFERER] ${req.method} ${req.originalUrl} <- ${req.headers.referer || req.headers.referrer}`
+        );
+
+
+        sendToProxy(
+            req,
+            res,
+            {
+
+                hostname:
+                    SITES.pin.hostname,
+
+                protocol:
+                    SITES.pin.protocol,
+
+                path:
+                    pathname,
+
+                search:
+                    req.url.includes('?')
+                        ? req.url.substring(
+                            req.url.indexOf('?')
+                        )
+                        : '',
+
+                siteName:
+                    'pin'
+            }
+        );
+
+        return;
+    }
+
+
+    /*
+     * ========================================
+     * NORMAL PROXY URL
+     * ========================================
+     */
+
     let parsed;
 
     try {
 
         parsed =
-            parseExplicitSiteUrl(
+            parseProxyUrl(
                 req.url
             );
 
     } catch (error) {
 
-        res.status(400).send(
-            `Invalid proxy URL: ${error.message}`
-        );
+        res
+            .status(400)
+            .send(
+                `Invalid proxy URL: ${error.message}`
+            );
 
         return;
     }
@@ -870,96 +946,29 @@ function proxyRequest(req, res) {
 
     if (!parsed) {
 
-        res.status(404).send(
-            'Unknown or invalid proxy path'
-        );
+        res
+            .status(404)
+            .send(
+                'Unknown or invalid proxy path'
+            );
 
         return;
     }
 
 
-    const {
-        hostname,
-        protocol,
-        path,
-        search
-    } = parsed;
-
-
-    resolveDoH(hostname)
-
-        .then(ip => {
-
-            console.log(
-                `[DNS] ${hostname} -> ${ip}`
-            );
-
-            console.log(
-                `[PROXY] ${req.method} ${hostname}${path}${search}`
-            );
-
-
-            req.url =
-                path +
-                search;
-
-
-            const agent =
-                new https.Agent({
-                    servername:
-                        hostname
-                });
-
-
-            proxy.web(
-                req,
-                res,
-                {
-
-                    target:
-                        `${protocol}//${ip}`,
-
-                    changeOrigin:
-                        true,
-
-                    selfHandleResponse:
-                        true,
-
-                    agent,
-
-                    headers: {
-
-                        Host:
-                            hostname,
-
-                        'Accept-Encoding':
-                            'identity'
-                    }
-                }
-            );
-
-        })
-
-        .catch(error => {
-
-            console.error(
-                `[ERROR] ${hostname}:`,
-                error.message
-            );
-
-            if (!res.headersSent) {
-
-                res.status(502).send(
-                    `DNS/proxy error: ${error.message}`
-                );
-            }
-        });
+    sendToProxy(
+        req,
+        res,
+        parsed
+    );
 }
 
 
-/* =========================================================
-   PROXY RESPONSE
-   ========================================================= */
+/*
+ * ============================================
+ * PROXY RESPONSE
+ * ============================================
+ */
 
 proxy.on(
     'proxyRes',
@@ -975,6 +984,7 @@ proxy.on(
 
         proxyRes.on(
             'data',
+
             chunk => {
                 chunks.push(chunk);
             }
@@ -987,56 +997,110 @@ proxy.on(
             () => {
 
                 const body =
-                    Buffer.concat(
-                        chunks
-                    );
+                    Buffer.concat(chunks);
 
 
                 const contentType =
-                    proxyRes.headers[
-                        'content-type'
-                    ] || '';
-
-
-                let currentSite =
-                    null;
-
-
-                try {
-
-                    const parsed =
-                        parseExplicitSiteUrl(
-                            req.originalUrl ||
-                            req.url
-                        );
-
-                    currentSite =
-                        parsed?.siteName ||
-                        null;
-
-                } catch {
-                    currentSite =
-                        null;
-                }
+                    proxyRes
+                        .headers[
+                            'content-type'
+                        ] || '';
 
 
                 /*
-                 * Rewrite redirects.
+                 * The site was explicitly recorded
+                 * by sendToProxy().
+                 */
+
+                const currentSite =
+                    req.proxySiteName || null;
+
+
+                /*
+                 * =================================
+                 * LOCATION HEADER
+                 * =================================
                  */
 
                 if (
-                    proxyRes.headers.location
+                    proxyRes
+                        .headers
+                        .location
                 ) {
 
                     const location =
-                        proxyRes.headers.location;
+                        proxyRes
+                            .headers
+                            .location;
+
+                    let rewrittenLocation;
 
 
-                    const rewrittenLocation =
-                        makeLocalUrl(
-                            location
-                        );
+                    if (
+                        location.startsWith(
+                            'http://'
+                        ) ||
+                        location.startsWith(
+                            'https://'
+                        )
+                    ) {
 
+                        rewrittenLocation =
+                            makeLocalUrl(
+                                location
+                            );
+
+                    } else if (
+                        location.startsWith('//')
+                    ) {
+
+                        rewrittenLocation =
+                            makeLocalUrl(
+                                `https:${location}`
+                            );
+
+                    } else if (
+                        location.startsWith('/') &&
+                        currentSite
+                    ) {
+
+                        /*
+                         * Don't double-prefix.
+                         */
+
+                        if (
+                            location ===
+                            '/' + currentSite ||
+
+                            location.startsWith(
+                                '/' +
+                                currentSite +
+                                '/'
+                            )
+                        ) {
+
+                            rewrittenLocation =
+                                location;
+
+                        } else {
+
+                            rewrittenLocation =
+                                '/' +
+                                currentSite +
+                                location;
+                        }
+
+                    } else {
+
+                        rewrittenLocation =
+                            location;
+                    }
+
+
+                    /*
+                     * Avoid redirecting a request
+                     * back to itself.
+                     */
 
                     if (
                         rewrittenLocation ===
@@ -1058,15 +1122,96 @@ proxy.on(
 
 
                 /*
-                 * HTML
+                 * =================================
+                 * PINTEREST HTML
+                 * =================================
+                 *
+                 * IMPORTANT:
+                 *
+                 * Pinterest HTML is returned
+                 * completely untouched.
+                 *
+                 * No:
+                 *
+                 *   - DOM rewriting
+                 *   - script injection
+                 *   - __PWS_DATA__ modification
+                 *   - attribute rewriting
+                 *
+                 * This is specifically to avoid
+                 * React hydration mismatches.
+                 */
+
+                if (
+                    currentSite === 'pin' &&
+                    contentType
+                        .toLowerCase()
+                        .includes('text/html')
+                ) {
+
+                    /*
+                     * We can remove these response
+                     * headers without touching the
+                     * HTML body.
+                     */
+
+                    delete proxyRes
+                        .headers[
+                            'content-security-policy'
+                        ];
+
+                    delete proxyRes
+                        .headers[
+                            'content-security-policy-report-only'
+                        ];
+
+                    delete proxyRes
+                        .headers[
+                            'x-frame-options'
+                        ];
+
+
+                    /*
+                     * Body is sent EXACTLY as received.
+                     */
+
+                    delete proxyRes
+                        .headers[
+                            'content-length'
+                        ];
+
+                    delete proxyRes
+                        .headers[
+                            'content-encoding'
+                        ];
+
+
+                    res.writeHead(
+                        proxyRes.statusCode,
+                        proxyRes.headers
+                    );
+
+
+                    res.end(body);
+
+                    return;
+                }
+
+
+                /*
+                 * =================================
+                 * OTHER HTML
+                 * =================================
+                 *
+                 * Wikipedia/GitHub/example can
+                 * still use the old HTML rewriting
+                 * behavior.
                  */
 
                 if (
                     contentType
                         .toLowerCase()
-                        .includes(
-                            'text/html'
-                        )
+                        .includes('text/html')
                 ) {
 
                     delete proxyRes
@@ -1086,32 +1231,22 @@ proxy.on(
 
 
                     let html =
-                        body.toString(
-                            'utf8'
-                        );
+                        body.toString('utf8');
 
 
-                    if (
-                        currentSite
-                    ) {
+                    if (currentSite) {
 
                         html =
-                            rewriteHtml(
+                            removeCspMetaTags(
+                                html
+                            );
+
+                        html =
+                            rewriteHtmlAttributes(
                                 html,
                                 currentSite
                             );
                     }
-
-
-                    /*
-                     * Install the service worker
-                     * registration into the page.
-                     */
-
-                    html =
-                        injectServiceWorker(
-                            html
-                        );
 
 
                     delete proxyRes
@@ -1131,16 +1266,16 @@ proxy.on(
                     );
 
 
-                    res.end(
-                        html
-                    );
+                    res.end(html);
 
                     return;
                 }
 
 
                 /*
-                 * Non-HTML response.
+                 * =================================
+                 * NON-HTML
+                 * =================================
                  */
 
                 res.writeHead(
@@ -1149,18 +1284,18 @@ proxy.on(
                 );
 
 
-                res.end(
-                    body
-                );
+                res.end(body);
             }
         );
     }
 );
 
 
-/* =========================================================
-   PROXY ERROR
-   ========================================================= */
+/*
+ * ============================================
+ * PROXY ERROR
+ * ============================================
+ */
 
 proxy.on(
     'error',
@@ -1178,8 +1313,7 @@ proxy.on(
 
         if (!res.headersSent) {
 
-            res.statusCode =
-                502;
+            res.statusCode = 502;
 
             res.end(
                 `Proxy error: ${error.message}`
@@ -1189,9 +1323,11 @@ proxy.on(
 );
 
 
-/* =========================================================
-   EXPRESS
-   ========================================================= */
+/*
+ * ============================================
+ * EXPRESS
+ * ============================================
+ */
 
 app.use(
     '/',
@@ -1199,9 +1335,11 @@ app.use(
 );
 
 
-/* =========================================================
-   START
-   ========================================================= */
+/*
+ * ============================================
+ * START SERVER
+ * ============================================
+ */
 
 app.listen(
     PORT,
