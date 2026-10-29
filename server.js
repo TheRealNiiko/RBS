@@ -30,9 +30,9 @@ const SITES = {
         hostname: 'example.com'
     },
 
-    pin: {
+    chess: {
         protocol: 'https:',
-        hostname: 'www.pinterest.com'
+        hostname: 'ches.com'
     }
 };
 
